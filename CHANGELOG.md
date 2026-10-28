@@ -6,6 +6,10 @@ The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 
 ## [Unreleased]
 
+### Added
+
+- **`/obsidian-health` flags a source that calls itself unverified in prose but carries no `source_quality` (#258).** A correction that lives only in the body is invisible to every check that reads fields, `Source quality` included, because a source with no label is unjudged. The new `Source quality (unlabelled)` warning reads the first 12 non-empty body lines of each `type: source` note that has no `source_quality` key at all, code removed after the cut, and fires on a short fixed list: `unverified`, `not verified`, `unconfirmed`, `speculative`, `speculation`, `provenance unknown` (also `provenance: unknown`). A present but malformed label is left alone: that is a different problem with a different fix. `summary` and `not verbatim` are deliberately not on it, since they do not by themselves lower the grade. The finding quotes the phrase it matched. Labelled sources and vaults that never use the words stay silent, and `"source_quality_policy": "silent"` mutes it. Twenty-one tests; removing the label check, the preamble bound or the cut-before-strip order turns them red.
+
 ### Fixed
 
 - **Folder ingestion skipped `.docx`, `.doc` and `.odt` files as "unsupported format" (#370).** `scripts/ingest_batch.py` only knew text, PDF, audio and image suffixes, so Office/OpenDocument text never reached the LibreOffice conversion that single-source `/obsidian-ingest` already uses. Discovery now returns them with format `document`, and each one goes through the existing single-source handler (`document_to_pdf.py`, then PDF ingestion). Originals stay untouched; a missing LibreOffice or a failed conversion leaves the source unfinished, without a completion receipt, like any other extraction failure. A test in `tests/test_ingest_batch.py` fails on the previous `main`.
