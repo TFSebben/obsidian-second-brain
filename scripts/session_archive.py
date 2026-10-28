@@ -17,9 +17,10 @@ sessions it cut 1.9 GB of JSONL to 5.5 MB of text. Secrets that survive in
 the conversation itself are redacted before anything is written.
 
 Opt-in and inert by default: nothing is written unless OBSIDIAN_SESSION_ARCHIVE
-is on (environment or the config file). One file per session, keyed by the
-session id, so a second save of the same chat refreshes its file instead of
-adding another.
+is on (environment or the config file). A chat is cut into parts of about
+7,000 characters at turn boundaries, so the semantic index embeds every part
+whole; parts link to each other. Files are keyed by the session id, so a
+second save of the same chat refreshes its parts instead of adding copies.
 
 Usage:
   uv run python scripts/session_archive.py --latest --cwd "$PWD"
@@ -46,6 +47,10 @@ import osb_env  # noqa: E402
 
 ENABLE_KEY = "OBSIDIAN_SESSION_ARCHIVE"
 SESSIONS_DIR = Path("raw") / "sessions"
+# Body characters per part. The semantic index embeds 8 chunks of ~1,000 body
+# characters each after the identity header, so 7,000 leaves room for the
+# header and frontmatter and every part is embedded whole.
+PART_CHARS = 7000
 
 # Injected context that rides inside user turns but was never said by the user.
 _INJECTED = re.compile(
@@ -186,15 +191,9 @@ def _local(stamp: str) -> datetime | None:
         return None
 
 
-def render(session: dict, source: Path) -> tuple[str, str, int]:
-    """Return (file name, note text, redaction count)."""
-    turns = session["turns"]
-    first = _local(turns[0]["time"]) if turns else None
-    day = first.strftime("%Y-%m-%d") if first else datetime.now().strftime("%Y-%m-%d")
-    title = session["title"] or turns[0]["text"].splitlines()[0][:60]
-    short_id = session["session_id"][:8]
-
-    body_lines: list[str] = []
+def _blocks(turns: list[dict]) -> tuple[list[str], int]:
+    """One redacted, labelled text block per turn, long turns cut to fit a part."""
+    blocks: list[str] = []
     redactions = 0
     for turn in turns:
         when = _local(turn["time"])
@@ -202,48 +201,95 @@ def render(session: dict, source: Path) -> tuple[str, str, int]:
         stamp = when.strftime("%Y-%m-%d %H:%M") if when else ""
         text, n = redact(turn["text"])
         redactions += n
-        body_lines += [f"**{label}** ({stamp})", "", text, ""]
-    body = "\n".join(body_lines).rstrip() + "\n"
-    safe_title, n = redact(title)
+        room = PART_CHARS - 80
+        pieces = [text[i:i + room] for i in range(0, len(text), room)] or [""]
+        for k, piece in enumerate(pieces):
+            more = " (continued)" if k else ""
+            blocks.append(f"**{label}** ({stamp}){more}\n\n{piece}\n")
+    return blocks, redactions
+
+
+def _split(blocks: list[str]) -> list[str]:
+    """Greedy, in order: earlier parts keep their content as a chat grows."""
+    parts: list[str] = []
+    current = ""
+    for block in blocks:
+        if current and len(current) + len(block) > PART_CHARS:
+            parts.append(current)
+            current = ""
+        current += block + "\n"
+    if current:
+        parts.append(current)
+    return parts
+
+
+def render(session: dict, source: Path, base: str | None = None
+           ) -> tuple[list[tuple[str, str]], int]:
+    """Return ([(file name, note text) per part], redaction count).
+
+    A long chat is cut into parts at turn boundaries because the semantic index
+    embeds only the first 8 chunks (~9.6k characters) of a note. In one file,
+    everything said after that point was findable by exact words only.
+    """
+    turns = session["turns"]
+    first = _local(turns[0]["time"]) if turns else None
+    day = first.strftime("%Y-%m-%d") if first else datetime.now().strftime("%Y-%m-%d")
+    title = session["title"] or turns[0]["text"].splitlines()[0][:60]
+    safe_title, redactions = redact(title)
+    blocks, n = _blocks(turns)
     redactions += n
+    bodies = _split(blocks)
+    base = base or f"{day} - {_slug(safe_title)} ({session['session_id'][:8]})"
+    names = [f"{base} part {i}" for i in range(1, len(bodies) + 1)]
 
-    content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
-    frontmatter = "\n".join([
-        "---",
-        f"date: {day}",
-        "type: source",
-        "tags: [source, session]",
-        "source_type: session",
-        f"source_path: {json.dumps(str(source))}",
-        f"session_id: {json.dumps(session['session_id'])}",
-        f"agent: {session['agent']}",
-        f"content_hash: {content_hash}",
-        "capture_scope: bounded-local",
-        "source_quality: medium",
-        f"redactions: {redactions}",
-        "ai-first: true",
-        "---",
-    ])
-    header = "\n".join([
-        f"# Session: {safe_title}",
-        "",
-        f"> **Agent:** {session['agent']} - **Session:** {session['session_id']}",
-        f"> **Folder:** {session['cwd'] or 'unknown'}",
-        "> **Kept:** what the user and the agent said. Tool calls, tool output, thinking",
-        f"> and injected context were dropped. {redactions} secret(s) redacted.",
-        "",
-    ])
-    name = f"{day} - {_slug(safe_title)} ({short_id}).md"
-    return name, f"{frontmatter}\n\n{header}\n{body}", redactions
+    out: list[tuple[str, str]] = []
+    for i, body in enumerate(bodies):
+        content_hash = hashlib.sha256(body.encode("utf-8")).hexdigest()
+        frontmatter = "\n".join([
+            "---",
+            f"date: {day}",
+            "type: source",
+            "tags: [source, session]",
+            "source_type: session",
+            f"source_path: {json.dumps(str(source))}",
+            f"session_id: {json.dumps(session['session_id'])}",
+            f"agent: {session['agent']}",
+            f"part: {i + 1}",
+            f"parts: {len(bodies)}",
+            f"content_hash: {content_hash}",
+            "capture_scope: bounded-local",
+            "source_quality: medium",
+            f"redactions: {redactions}",
+            "ai-first: true",
+            "---",
+        ])
+        nav = []
+        if i:
+            nav.append(f"previous: [[{names[i - 1]}]]")
+        if i + 1 < len(bodies):
+            nav.append(f"next: [[{names[i + 1]}]]")
+        header = "\n".join([
+            f"# Session: {safe_title} (part {i + 1} of {len(bodies)})",
+            "",
+            f"> **Agent:** {session['agent']} - **Session:** {session['session_id']}",
+            f"> **Folder:** {session['cwd'] or 'unknown'}",
+            "> **Kept:** what the user and the agent said. Tool calls, tool output, thinking",
+            f"> and injected context were dropped. {redactions} secret(s) redacted.",
+            *([f"> **Parts:** {' - '.join(nav)}"] if nav else []),
+            "",
+        ])
+        out.append((f"{names[i]}.md", f"{frontmatter}\n\n{header}\n{body.rstrip()}\n"))
+    return out, redactions
 
 
-def existing_file(sessions: Path, session_id: str) -> Path | None:
-    """A session already archived under any title keeps its file."""
-    tag = f"({session_id[:8]}).md"
-    for path in sessions.glob(f"*{tag}"):
-        if f"session_id: {json.dumps(session_id)}" in path.read_text(encoding="utf-8")[:1000]:
-            return path
-    return None
+def existing_parts(sessions: Path, session_id: str) -> list[Path]:
+    """Files already holding this session, under whatever title they got."""
+    marker = f"session_id: {json.dumps(session_id)}"
+    found = []
+    for path in sessions.glob(f"*({session_id[:8]})*.md"):
+        if marker in path.read_text(encoding="utf-8")[:1200]:
+            found.append(path)
+    return sorted(found)
 
 
 def is_enabled() -> bool:
@@ -255,20 +301,27 @@ def archive(transcript: Path, vault: Path, agent: str = "claude-code",
     session = READERS[agent](transcript)
     if not session["turns"]:
         return {"status": "empty", "transcript": str(transcript)}
-    name, text, redactions = render(session, transcript)
     sessions = vault / SESSIONS_DIR
-    target = existing_file(sessions, session["session_id"]) if sessions.is_dir() else None
-    target = target or sessions / name
+    old = existing_parts(sessions, session["session_id"]) if sessions.is_dir() else []
+    # A session keeps the name it was first archived under, even if its title changes.
+    base = re.sub(r"( part \d+)?\.md$", "", old[0].name) if old else None
+    parts, redactions = render(session, transcript, base)
+    targets = [sessions / name for name, _ in parts]
     result = {
         "status": "dry-run" if dry_run else "written",
-        "path": target.relative_to(vault).as_posix(),
+        "paths": [p.relative_to(vault).as_posix() for p in targets],
         "turns": len(session["turns"]),
-        "chars": len(text),
+        "chars": sum(len(text) for _, text in parts),
         "redactions": redactions,
     }
     if not dry_run:
         sessions.mkdir(parents=True, exist_ok=True)
-        target.write_text(text, encoding="utf-8")
+        for target, (_, text) in zip(targets, parts):
+            target.write_text(text, encoding="utf-8")
+        # Only files of this same session are ever removed: the unsplit file an
+        # earlier version wrote, replaced by its parts just above.
+        for stale in set(old) - set(targets):
+            stale.unlink()
     return result
 
 

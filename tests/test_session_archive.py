@@ -76,7 +76,7 @@ def test_reader_keeps_only_what_was_said(tmp_path):
 def test_secrets_are_redacted_before_writing(tmp_path, monkeypatch):
     monkeypatch.setenv(sa.ENABLE_KEY, "1")
     result = sa.archive(sample(tmp_path), tmp_path / "vault")
-    note = (tmp_path / "vault" / result["path"]).read_text(encoding="utf-8")
+    note = (tmp_path / "vault" / result["paths"][0]).read_text(encoding="utf-8")
     assert FAKE_ANTHROPIC not in note and FAKE_GITHUB not in note
     assert "[REDACTED:api-key]" in note and "[REDACTED:github-token]" in note
     assert result["redactions"] == 2
@@ -100,8 +100,8 @@ def test_redact_env_and_bearer_shapes():
 
 def test_note_is_a_raw_source_capture(tmp_path):
     result = sa.archive(sample(tmp_path), tmp_path / "vault")
-    assert result["path"].startswith("raw/sessions/2026-10-28 - Demo chat (abcd1234)")
-    note = (tmp_path / "vault" / result["path"]).read_text(encoding="utf-8")
+    assert result["paths"] == ["raw/sessions/2026-10-28 - Demo chat (abcd1234) part 1.md"]
+    note = (tmp_path / "vault" / result["paths"][0]).read_text(encoding="utf-8")
     for line in ("type: source", "source_type: session", "capture_scope: bounded-local",
                  "ai-first: true", 'session_id: "abcd1234-0000-0000-0000-000000000000"'):
         assert line in note
@@ -115,10 +115,46 @@ def test_second_save_refreshes_the_same_file(tmp_path):
         fh.write(json.dumps({"type": "ai-title", "aiTitle": "Renamed later"}) + "\n")
         fh.write(json.dumps(entry("user", "one more thing", 8)) + "\n")
     second = sa.archive(path, vault)
-    assert second["path"] == first["path"]
+    assert second["paths"] == first["paths"]
     files = list((vault / "raw" / "sessions").iterdir())
     assert len(files) == 1
     assert "one more thing" in files[0].read_text(encoding="utf-8")
+
+
+def test_long_chat_splits_into_linked_parts_that_embed_whole(tmp_path):
+    turns = []
+    for n in range(1, 41):
+        kind = "user" if n % 2 else "assistant"
+        content = f"fact number {n} " + "x" * 900
+        turns.append(entry(kind, content if kind == "user" else [{"type": "text", "text": content}], n))
+    turns.append(entry("user", "y" * 20000, 50))  # one turn longer than a part
+    vault = tmp_path / "vault"
+    result = sa.archive(write_transcript(tmp_path / "long.jsonl", turns), vault)
+    notes = [(vault / p).read_text(encoding="utf-8") for p in result["paths"]]
+    assert len(notes) > 3
+    joined = "\n".join(notes)
+    for n in range(1, 41):
+        assert f"fact number {n} " in joined
+    assert joined.count("y" * 100) >= 20000 // 100 - len(notes)
+    for i, note in enumerate(notes, 1):
+        body = note.split("\n---\n", 1)[1]
+        assert len(body) < 9000, "part would overflow the 8-chunk embed cap"
+        assert f"part: {i}" in note and f"parts: {len(notes)}" in note
+    assert "next: [[" in notes[0] and "previous: [[" in notes[-1]
+
+
+def test_unsplit_file_from_earlier_version_is_replaced(tmp_path):
+    vault = tmp_path / "vault"
+    sessions = vault / "raw" / "sessions"
+    sessions.mkdir(parents=True)
+    old = sessions / "2026-10-28 - Old title (abcd1234).md"
+    old.write_text('---\nsession_id: "abcd1234-0000-0000-0000-000000000000"\n---\n',
+                   encoding="utf-8")
+    other = sessions / "2026-10-28 - Someone else (abcd1234).md"
+    other.write_text('---\nsession_id: "abcd1234-ffff"\n---\n', encoding="utf-8")
+    result = sa.archive(sample(tmp_path), vault)
+    assert result["paths"] == ["raw/sessions/2026-10-28 - Old title (abcd1234) part 1.md"]
+    assert not old.exists() and other.exists()
 
 
 def test_latest_picks_the_newest_session_for_the_folder(tmp_path, monkeypatch):
